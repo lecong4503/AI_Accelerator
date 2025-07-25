@@ -10,13 +10,13 @@ module data_mover #(
     parameter AC_BW     = 21,
     parameter AB_BW     = 22,
     // BRAM
-    parameter AWIDTH    = 6,
+    parameter AWIDTH    = 8,
     parameter DWIDTH    = 32,
     // Line Buffer
-    parameter PIXEL     = 4,
+    parameter PACKET     = 4,
     parameter TOTAL_PIX = KW * KH,
-    parameter QUOTIENT  = TOTAL_PIX / PIXEL,
-    parameter HAS_REM   = TOTAL % PIXEL,
+    parameter QUOTIENT  = TOTAL_PIX / PACKET,
+    parameter HAS_REM   = TOTAL_PIX % PACKET,
     parameter N_CYCLES  = QUOTIENT + HAS_REM
 )
 (
@@ -35,10 +35,10 @@ module data_mover #(
 );
 
     localparam IDLE = 2'b00;
-    localparam READ = 2'b01;
-    localparam SEND = 2'b10;
-    localparam DONE = 2'b11;
+    localparam RUN  = 2'b01;
+    localparam DONE = 2'b10;
 
+    //// State Update
     reg [1:0] c_state, n_state;
 
     always @ (posedge clk) begin
@@ -49,97 +49,132 @@ module data_mover #(
         end
     end
 
-    reg read_done;
+    //// FSM Update
+    reg run_done;
     reg send_done;
 
     always @ (*) begin
         n_state <= c_state;
         case (c_state) 
             IDLE : if (i_run)
-                n_state <= READ;
-            READ : if (read_done)
-                n_state <= SEND;
-            SEND : if (send_done)
+                n_state <= RUN;
+            RUN  : if (run_done)
                 n_state <= DONE;
             DONE : n_state <= IDLE;
             default : n_state <= IDLE;
         endcase
     end
 
+////// 1. Receive to Bram Data //////
+    reg [DWIDTH-1:0] r_fmap_packet;
     reg [AWIDTH-1:0] addr_cnt;
-    reg [AWIDTH-1:0] data_idx;
+    reg fmap_valid, fmap_pix_ready;
+    reg read_en_d1;
 
-    wire w_en = (c_state == READ) && (addr_cnt < 8);
+    wire read_en = fmap_pix_ready && addr_cnt < 256 && c_state == RUN;
+    wire w_en = read_en;
     
+    // address counter
     always @ (posedge clk) begin
         if (rst) begin
             addr_cnt <= 0;
-        end else if (c_state == READ) begin
-            if (addr_cnt < 8)
+        end else if (read_en) begin
+            if (addr_cnt < 256)
                 addr_cnt <= addr_cnt + 1;
-        end else begin
-            addr_cnt <= 0;
         end
     end
 
     assign addr = addr_cnt;
     assign en = w_en;
-    
+
+    // 1 clk delay - ifmap valid
     always @ (posedge clk) begin
         if (rst) begin
-            data_idx <= 0;
-        end else if (c_state == READ) begin
-            if (addr_cnt < 8)
-                data_idx <= addr_cnt;
+            read_en_d1 <= 0;
         end else begin
-            data_idx <= 0;
-        end
-    end
-
-    reg [KW*KH*D_BW-1:0] r_buff_fmap;
-
-    always @ (posedge clk) begin
-        if (rst) begin
-            r_buff_fmap <= 0;
-        end else if (c_state == READ) begin
-            case (data_idx)
-                6'd1 : r_buff_fmap[31:0] <= i_fmap;
-                6'd2 : r_buff_fmap[63:32] <= i_fmap;
-                6'd3 : r_buff_fmap[95:64] <= i_fmap;
-                6'd4 : r_buff_fmap[127:96] <= i_fmap;
-                6'd5 : r_buff_fmap[159:128] <= i_fmap;
-                6'd6 : r_buff_fmap[191:160] <= i_fmap;
-                6'd7 : r_buff_fmap[199:192] <= i_fmap[7:0];
-            default : ;
-            endcase
+            read_en_d1 <= read_en;
         end
     end
 
     always @ (posedge clk) begin
         if (rst) begin
-            read_done <= 0;
-        end else if (data_idx == 7) begin
-            read_done <= 1;
+            fmap_valid <= 0;
         end else begin
-            read_done <= 0;
+            fmap_valid <= read_en_d1;
         end
     end
 
-    reg [KW*KH*D_BW-1:0] r_buff_out_fmap;
-    
+    // FMAP(PACKET) REG
     always @ (posedge clk) begin
         if (rst) begin
-            r_buff_out_fmap <= 0;
-            send_done <= 0;
-        end else if (c_state == SEND) begin
-            r_buff_out_fmap <= r_buff_fmap;
-            send_done <= 1;
-        end else begin
-            send_done <= 0;
+            r_fmap_packet <= 0;
+        end else if (fmap_valid) begin
+            r_fmap_packet <= i_fmap;
         end
     end
 
-    assign o_fmap = r_buff_out_fmap;
+////// 2. Devide Packet -> 4 Pixels //////
+    reg [IF_BW-1:0] r_fmap_pix [0:PACKET-1];
+    reg [1:0] fmap_pix_cnt;
+    reg fmap_pix_valid;
+    reg busy;
+
+    wire fmap_pix_ready;
+    wire hs_fmap_packet_in = fmap_valid && fmap_pix_ready; 
+
+    assign fmap_pix_ready = ~busy;
+
+    always @ (posedge clk) begin
+        if (rst) begin
+            fmap_pix_valid <= 0;
+        end else begin
+            fmap_pix_valid <= hs_fmap_packet_in;
+        end
+    end
+
+    always @ (posedge clk) begin
+        if (rst) begin
+            busy <= 0;
+            fmap_pix_cnt <= 0;
+        end else if (hs_fmap_packet_in) begin
+            if (fmap_pix_cnt == 3) begin
+                fmap_pix_cnt <= 0;
+                busy <= 0;
+            end else begin
+                fmap_pix_cnt <= fmap_pix_cnt + 1;
+                busy <= 1;
+            end
+        end
+    end
+
+    genvar i;
+    generate
+        for (i=0; i<PACKET; i=i+1) begin : PIXEL_DEVIDE
+            always @ (posedge clk) begin
+                if (rst) begin
+                    r_fmap_pix[i] <= {IF_BW{1'b0}};
+                end else if (fmap_pix_valid) begin
+                    r_fmap_pix[i] <= r_fmap_packet[i*IF_BW +: IF_BW];
+                end
+            end
+        end
+    endgenerate
+
+////// 3. Shift Fmap
+    reg [IF_BW-1:0] shift_fmap[27:0];
+
+    always @ (posedge clk) begin
+        if (rst) begin
+            fmap_pix_idx <= 0;
+        end else if (fmap_pix_valid) begin
+            if (fmap_pix_idx < 4) begin
+                r_fmap_pix_idx <= r_fmap_pix_idx + 1;
+            end else begin
+                r_fmap_pix_idx <= 0;
+            end
+        end
+    end
+
 
 endmodule
     
